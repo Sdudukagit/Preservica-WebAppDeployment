@@ -1,0 +1,579 @@
+pr:
+  branches:
+    include:
+      - dev
+  paths:
+    exclude:
+      - README.md
+
+trigger:
+ branches:
+   include:
+     - master
+ paths:
+   exclude:
+     - README.md
+     - azure-pipelines-ci-cd.yml
+
+parameters:
+- name: runCompletePipeline
+  displayName: Run All Tasks ?
+  type: boolean
+  default: true
+
+stages:
+- stage: Build_Stage
+  displayName: Build Apps
+  jobs:
+
+  - job: WebApp
+    displayName: Build Web App
+    pool:
+      name: Hosted Windows 2019 with VS2019 
+      vmImage: 'windows-2019'
+    variables:
+      BuildConfiguration: release
+    steps:
+
+    - task: UseDotNet@2
+      displayName: Install .NET 6 sdk
+      inputs:
+        packageType: sdk
+        version: 6.0.x
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+
+    - task: DotNetCoreCLI@2
+      displayName: Restore Nuget Packages
+      inputs:
+        command: restore
+        projects: '**/WebApp1.csproj'
+    
+    - task: DotNetCoreCLI@2
+      displayName: Restore Nuget Packages
+      inputs:
+        command: restore
+        projects: '**/WebApp2.csproj'
+
+    - task: DotNetCoreCLI@2
+      displayName: Build WebApp
+      inputs:
+        projects: '**/WebApp1.csproj'
+        arguments: '--configuration $(BuildConfiguration)'
+
+    - task: DotNetCoreCLI@2
+      displayName: Build WebApp
+      inputs:
+        projects: '**/WebApp2.csproj'
+        arguments: '--configuration $(BuildConfiguration)'
+
+
+    - task: DotNetCoreCLI@2
+      displayName: Create WebApp1.zip
+      inputs:
+        command: publish
+        publishWebProjects: True
+        arguments: '--configuration $(BuildConfiguration) --output $(build.artifactstagingdirectory)'
+        zipAfterPublish: True
+
+    - task: DotNetCoreCLI@2
+      displayName: Create WebApp2.zip
+      inputs:
+        command: publish
+        publishWebProjects: True
+        arguments: '--configuration $(BuildConfiguration) --output $(build.artifactstagingdirectory)'
+        zipAfterPublish: True
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Artifact (WebApp1.zip)
+      inputs:
+        PathtoPublish: '$(build.artifactstagingdirectory)'
+        ArtifactName: drop
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Artifact (WebApp2.zip)
+      inputs:
+        PathtoPublish: '$(build.artifactstagingdirectory)'
+        ArtifactName: drop
+
+
+  - job: Database
+    displayName: Build Database
+    pool:
+      vmImage: 'windows-2019'
+      demands: msbuild
+    steps:
+
+    - task: MSBuild@1
+      displayName: Build WebApp1.Database.sqlproj
+      inputs:
+        solution: WebApp1.Database/WebApp1.Database.sqlproj
+        msbuildArguments: '/p:OutDir=$(Build.ArtifactStagingDirectory)'
+
+    - task: MSBuild@1
+      displayName: Build WebApp2.Database.sqlproj
+      inputs:
+        solution: WebApp2.Database/WebApp2.Database.sqlproj
+        msbuildArguments: '/p:OutDir=$(Build.ArtifactStagingDirectory)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: Publish Artifact (Dacpac)
+      inputs:
+        ArtifactName: dacpac
+
+  - job: Selenium
+    displayName: Build UI Tests
+    pool:
+      vmImage: 'windows-2019'
+      demands: msbuild
+
+    steps:
+    - task: NuGetToolInstaller@0
+      displayName: Use NuGet 4.3.0
+
+    - task: NuGetCommand@2
+      displayName: Restoore NuGet Packages
+      inputs:
+        restoreSolution: WebAppWithDatabase.sln
+
+    
+  - job: Infrastructure
+    displayName: Publish Infra files
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact: ARM templates'
+      inputs:
+        PathtoPublish: AzureResourceGroupDeployment
+        ArtifactName: arm
+
+- stage: Dev_Stage
+  displayName: Create & Deploy to Dev
+  dependsOn: Build_Stage
+  variables:
+    azureSubscription: 'WebAppWithDatabaseDemo_spn' # couldn't be referenced
+    ResourceGroupName: 'SharathAzure01'
+    Database.Admin: 'houssem'
+    Database.Password: '@Aa123456' # to be secured in Key Vault
+    Database.Name: 'EmployeesDB'
+    WebAppName1: '$(Prefix)-$(Release.EnvironmentName)-$(UniqueId)-WebAppName1'
+    WebAppNameUrl1: 'https://$(WebAppName1).azurewebsites.net/'
+    WebAppName2: '$(Prefix)-$(Release.EnvironmentName)-$(UniqueId)-WebAppName2'
+    WebAppNameUrl2: 'https://$(WebAppName2).azurewebsites.net/'
+    SqlServerName: '$(Prefix)-sql-$(Release.EnvironmentName)-$(UniqueId)'
+    Prefix: 'tunis'
+    Release.EnvironmentName: 'dev'
+    UniqueId: '1280' #'$(Build.BuildId)'
+    hostingPlanName: '$(Prefix)-service-plan-$(UniqueId)'
+
+  jobs:
+  - job: Create_DEV
+    displayName: Create DEV
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+
+    - checkout: none
+    - task: DownloadBuildArtifacts@0
+      displayName: Download ARM templates
+      inputs:
+        artifactName: arm
+        downloadPath: $(System.DefaultWorkingDirectory)
+
+    - task: AzureResourceGroupDeployment@2
+      displayName: Validate ARM templates
+      enabled: ${{ parameters.runCompletePipeline }}
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        action: 'Create Or Update Resource Group'
+        resourceGroupName: 'SharathAzure01'
+        location: 'West Europe'
+        templateLocation: 'Linked artifact'
+        csmFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.json'
+        csmParametersFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.parameters.json'
+        overrideParameters: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+        deploymentMode: 'Validation'
+
+    - task: AzureCLI@2
+      displayName: Preview Template Changes (What-If)
+      inputs:
+        workingDirectory: $(System.DefaultWorkingDirectory)/arm/
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: 'az deployment group what-if --resource-group $(ResourceGroupName) --name rollout01 --template-file  WebSiteSQLDatabase.json --parameters WebSiteSQLDatabase.parameters.json'
+        arguments: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+
+    - task: AzureResourceManagerTemplateDeployment@3
+      displayName: Deploy ARM templates
+      inputs:
+        deploymentScope: 'Resource Group'
+        azureResourceManagerConnection: 'WebAppWithDatabaseDemo_spn'
+        subscriptionId: 'daedc950-9ab4-40b2-bbc0-4e8b54086c80'
+        action: 'Create Or Update Resource Group'
+        resourceGroupName: '$(ResourceGroupName)'
+        location: 'West Europe'
+        templateLocation: 'Linked artifact'
+        csmFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.json'
+        csmParametersFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.parameters.json'
+        overrideParameters: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+        deploymentMode: 'Complete'
+
+  - job: Deploy_DEV
+    displayName: Deploy Apps to DEV
+    dependsOn: Create_DEV
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+
+    - checkout: none
+# new JOB: Deploy App & Database
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download WebApp1.zip
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern: '**/WebApp1.zip'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download WebApp2.zip
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern: '**/WebApp2.zip'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: AzureRmWebAppDeployment@3
+      displayName: Deploy WebApp to Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        appType: 'app'
+        WebAppName: '$(WebAppName1)'
+        Package: '$(System.DefaultWorkingDirectory)/drop/WebApp1.zip'
+        TakeAppOfflineFlag: true
+        JSONFiles: '**/appsettings.json'
+
+    - task: AzureRmWebAppDeployment@3
+      displayName: Deploy WebApp to Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        appType: 'app'
+        WebAppName: '$(WebAppName2)'
+        Package: '$(System.DefaultWorkingDirectory)/drop/WebApp2.zip'
+        TakeAppOfflineFlag: true
+        JSONFiles: '**/appsettings.json'
+
+
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download DacPac
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'dacpac'
+        itemPattern: '**/*.dacpac'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: SqlAzureDacpacDeployment@1
+      displayName: Deploy DacPac to SQL Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        AuthenticationType: 'server'
+        ServerName: '$(SqlServerName).database.windows.net,1433'
+        DatabaseName: '$(Database.Name)'
+        SqlUsername: '$(Database.Admin)'
+        SqlPassword: '$(Database.Password)'
+        deployType: 'DacpacTask'
+        DeploymentAction: 'Publish'
+        DacpacFile: '$(System.DefaultWorkingDirectory)/dacpac/WebApp1.Database.dacpac'
+        IpDetectionMethod: 'AutoDetect'
+
+
+- stage: Test_Stage
+  dependsOn: Build_Stage
+  variables:
+    azureSubscription: 'WebAppWithDatabaseDemo_spn' # couldn't be referenced
+    ResourceGroupName: 'SharathAzure01'
+    Database.Admin: 'houssem'
+    Database.Password: '@Aa123456' # to be secured in Key Vault
+    Database.Name: 'EmployeesDB'
+    WebAppName1: '$(Prefix)-$(Release.EnvironmentName)-$(UniqueId)-WebAppName1'
+    WebAppNameUrl1: 'https://$(WebAppName1).azurewebsites.net/'
+    WebAppName2: '$(Prefix)-$(Release.EnvironmentName)-$(UniqueId)-WebAppName2'
+    WebAppNameUrl2: 'https://$(WebAppName2).azurewebsites.net/'
+    SqlServerName: '$(Prefix)-sql-$(Release.EnvironmentName)-$(UniqueId)'
+    Prefix: 'tunis'
+    Release.EnvironmentName: 'dev'
+    UniqueId: '1280' #'$(Build.BuildId)'
+    hostingPlanName: '$(Prefix)-service-plan-$(UniqueId)'
+
+  jobs:
+  - job: Create_DEV
+    displayName: Create DEV
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+
+    - checkout: none
+    - task: DownloadBuildArtifacts@0
+      displayName: Download ARM templates
+      inputs:
+        artifactName: arm
+        downloadPath: $(System.DefaultWorkingDirectory)
+
+    - task: AzureResourceGroupDeployment@2
+      displayName: Validate ARM templates
+      enabled: ${{ parameters.runCompletePipeline }}
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        action: 'Create Or Update Resource Group'
+        resourceGroupName: 'SharathAzure01'
+        location: 'West Europe'
+        templateLocation: 'Linked artifact'
+        csmFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.json'
+        csmParametersFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.parameters.json'
+        overrideParameters: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+        deploymentMode: 'Validation'
+
+    - task: AzureCLI@2
+      displayName: Preview Template Changes (What-If)
+      inputs:
+        workingDirectory: $(System.DefaultWorkingDirectory)/arm/
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: 'az deployment group what-if --resource-group $(ResourceGroupName) --name rollout01 --template-file  WebSiteSQLDatabase.json --parameters WebSiteSQLDatabase.parameters.json'
+        arguments: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+
+    - task: AzureResourceManagerTemplateDeployment@3
+      displayName: Deploy ARM templates
+      inputs:
+        deploymentScope: 'Resource Group'
+        azureResourceManagerConnection: 'WebAppWithDatabaseDemo_spn'
+        subscriptionId: 'daedc950-9ab4-40b2-bbc0-4e8b54086c80'
+        action: 'Create Or Update Resource Group'
+        resourceGroupName: '$(ResourceGroupName)'
+        location: 'West Europe'
+        templateLocation: 'Linked artifact'
+        csmFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.json'
+        csmParametersFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.parameters.json'
+        overrideParameters: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+        deploymentMode: 'Complete'
+
+  - job: Deploy_DEV
+    displayName: Deploy Apps to DEV
+    dependsOn: Create_DEV
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+
+    - checkout: none
+# new JOB: Deploy App & Database
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download WebApp1.zip
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern: '**/WebApp1.zip'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download WebApp2.zip
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern: '**/WebApp2.zip'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: AzureRmWebAppDeployment@3
+      displayName: Deploy WebApp to Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        appType: 'app'
+        WebAppName: '$(WebAppName1)'
+        Package: '$(System.DefaultWorkingDirectory)/drop/WebApp1.zip'
+        TakeAppOfflineFlag: true
+        JSONFiles: '**/appsettings.json'
+
+    - task: AzureRmWebAppDeployment@3
+      displayName: Deploy WebApp to Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        appType: 'app'
+        WebAppName: '$(WebAppName2)'
+        Package: '$(System.DefaultWorkingDirectory)/drop/WebApp2.zip'
+        TakeAppOfflineFlag: true
+        JSONFiles: '**/appsettings.json'
+
+
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download DacPac
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'dacpac'
+        itemPattern: '**/*.dacpac'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: SqlAzureDacpacDeployment@1
+      displayName: Deploy DacPac to SQL Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        AuthenticationType: 'server'
+        ServerName: '$(SqlServerName).database.windows.net,1433'
+        DatabaseName: '$(Database.Name)'
+        SqlUsername: '$(Database.Admin)'
+        SqlPassword: '$(Database.Password)'
+        deployType: 'DacpacTask'
+        DeploymentAction: 'Publish'
+        DacpacFile: '$(System.DefaultWorkingDirectory)/dacpac/WebApp1.Database.dacpac'
+        IpDetectionMethod: 'AutoDetect'
+
+          
+- stage: Prod_Stage
+  displayName: Prod Stage
+  dependsOn: Build_Stage
+  variables:
+    azureSubscription: 'WebAppWithDatabaseDemo_spn' # couldn't be referenced
+    ResourceGroupName: 'SharathAzure01'
+    Database.Admin: 'houssem'
+    Database.Password: '@Aa123456' # to be secured in Key Vault
+    Database.Name: 'EmployeesDB'
+    WebAppName1: '$(Prefix)-$(Release.EnvironmentName)-$(UniqueId)-WebAppName1'
+    WebAppNameUrl1: 'https://$(WebAppName1).azurewebsites.net/'
+    WebAppName2: '$(Prefix)-$(Release.EnvironmentName)-$(UniqueId)-WebAppName2'
+    WebAppNameUrl2: 'https://$(WebAppName2).azurewebsites.net/'
+    SqlServerName: '$(Prefix)-sql-$(Release.EnvironmentName)-$(UniqueId)'
+    Prefix: 'tunis'
+    Release.EnvironmentName: 'dev'
+    UniqueId: '1280' #'$(Build.BuildId)'
+    hostingPlanName: '$(Prefix)-service-plan-$(UniqueId)'
+
+jobs:
+  - job: Create_DEV
+    displayName: Create DEV
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+
+    - checkout: none
+    - task: DownloadBuildArtifacts@0
+      displayName: Download ARM templates
+      inputs:
+        artifactName: arm
+        downloadPath: $(System.DefaultWorkingDirectory)
+
+    - task: AzureResourceGroupDeployment@2
+      displayName: Validate ARM templates
+      enabled: ${{ parameters.runCompletePipeline }}
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        action: 'Create Or Update Resource Group'
+        resourceGroupName: 'SharathAzure01'
+        location: 'West Europe'
+        templateLocation: 'Linked artifact'
+        csmFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.json'
+        csmParametersFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.parameters.json'
+        overrideParameters: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+        deploymentMode: 'Validation'
+
+    - task: AzureCLI@2
+      displayName: Preview Template Changes (What-If)
+      inputs:
+        workingDirectory: $(System.DefaultWorkingDirectory)/arm/
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: 'az deployment group what-if --resource-group $(ResourceGroupName) --name rollout01 --template-file  WebSiteSQLDatabase.json --parameters WebSiteSQLDatabase.parameters.json'
+        arguments: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+
+    - task: AzureResourceManagerTemplateDeployment@3
+      displayName: Deploy ARM templates
+      inputs:
+        deploymentScope: 'Resource Group'
+        azureResourceManagerConnection: 'WebAppWithDatabaseDemo_spn'
+        subscriptionId: 'daedc950-9ab4-40b2-bbc0-4e8b54086c80'
+        action: 'Create Or Update Resource Group'
+        resourceGroupName: '$(ResourceGroupName)'
+        location: 'West Europe'
+        templateLocation: 'Linked artifact'
+        csmFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.json'
+        csmParametersFile: '$(System.DefaultWorkingDirectory)/arm/WebSiteSQLDatabase.parameters.json'
+        overrideParameters: '-hostingPlanName $(hostingPlanName) -skuName "F1" -skuCapacity 1 -administratorLogin $(Database.Admin) -administratorLoginPassword $(Database.Password) -databaseName $(Database.Name) -collation "SQL_Latin1_General_CP1_CI_AS" -edition "Basic" -maxSizeBytes "1073741824" -requestedServiceObjectiveName "Basic" -webSiteName $(WebAppName) -sqlserverName $(SqlServerName)'
+        deploymentMode: 'Complete'
+
+  - job: Deploy_DEV
+    displayName: Deploy Apps to DEV
+    dependsOn: Create_DEV
+    pool:
+      vmImage: 'windows-2019'
+    steps:
+
+    - checkout: none
+# new JOB: Deploy App & Database
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download WebApp1.zip
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern: '**/WebApp1.zip'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download WebApp2.zip
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'drop'
+        itemPattern: '**/WebApp2.zip'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: AzureRmWebAppDeployment@3
+      displayName: Deploy WebApp to Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        appType: 'app'
+        WebAppName: '$(WebAppName1)'
+        Package: '$(System.DefaultWorkingDirectory)/drop/WebApp1.zip'
+        TakeAppOfflineFlag: true
+        JSONFiles: '**/appsettings.json'
+
+    - task: AzureRmWebAppDeployment@3
+      displayName: Deploy WebApp to Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        appType: 'app'
+        WebAppName: '$(WebAppName2)'
+        Package: '$(System.DefaultWorkingDirectory)/drop/WebApp2.zip'
+        TakeAppOfflineFlag: true
+        JSONFiles: '**/appsettings.json'
+
+
+    - task: DownloadBuildArtifacts@0    
+      displayName: Download DacPac
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        artifactName: 'dacpac'
+        itemPattern: '**/*.dacpac'
+        downloadPath: '$(System.DefaultWorkingDirectory)'
+
+    - task: SqlAzureDacpacDeployment@1
+      displayName: Deploy DacPac to SQL Azure
+      inputs:
+        azureSubscription: 'WebAppWithDatabaseDemo_spn'
+        AuthenticationType: 'server'
+        ServerName: '$(SqlServerName).database.windows.net,1433'
+        DatabaseName: '$(Database.Name)'
+        SqlUsername: '$(Database.Admin)'
+        SqlPassword: '$(Database.Password)'
+        deployType: 'DacpacTask'
+        DeploymentAction: 'Publish'
+        DacpacFile: '$(System.DefaultWorkingDirectory)/dacpac/WebApp1.Database.dacpac'
+        IpDetectionMethod: 'AutoDetect'
